@@ -1,22 +1,105 @@
-# 整合文件为csv，同时去除重组项目
+# 整合文件为csv，同时合并重组项目,按剩本剔除相同期数行
 import pandas as pd
 import os
 import glob
 import time
+import re  # 新增：正则匹配重组后缀
+
+
+def merge_restruct_contracts(df):
+    """
+    合并重组合同：将-CZ01/-CZ02/-RA01等后缀的重组合同映射回原始合同，期号连续顺延
+    同时剔除重组节点的过渡ADV记录，保证剩余本金与结清判断准确
+    """
+    df = df.copy()
+
+    # 确保期号为数值型，保证偏移计算正确
+    df['期号'] = pd.to_numeric(df['期号'], errors='coerce')
+
+    # ========== 1. 提取原始合同号与重组批次 ==========
+    suffix_pattern = r'-(CZ|RA)\d+$'
+    df['原始合同号'] = df['合同号'].str.replace(suffix_pattern, '', regex=True, case=False)
+
+    batch_num = df['合同号'].str.extract(r'-(?:CZ|RA)(\d+)$', flags=re.IGNORECASE)[0]
+    df['重组批次'] = batch_num.fillna(0).astype(int)
+
+    # ========== 2. 计算每个批次的期号偏移量 ==========
+    batch_max_period = df.groupby(['原始合同号', '重组批次'])['期号'].max().reset_index()
+    batch_max_period = batch_max_period.sort_values(['原始合同号', '重组批次'])
+
+    batch_max_period['期号偏移'] = (
+            batch_max_period.groupby('原始合同号')['期号'].cumsum()
+            - batch_max_period['期号']
+    )
+
+    df = df.merge(
+        batch_max_period[['原始合同号', '重组批次', '期号偏移']],
+        on=['原始合同号', '重组批次'],
+        how='left'
+    )
+
+    # ========== 3. 生成连续期号 + 统一合同号 ==========
+    df['期号'] = df['期号'] + df['期号偏移']
+    df['合同号'] = df['原始合同号']
+
+    # ========== 新增：剔除重组节点的过渡ADV记录 ==========
+    # 步骤A：找出存在多批次的重组合同（有后续重组批次，说明ADV是过渡而非真结清）
+    contract_batch_count = df.groupby('原始合同号')['重组批次'].nunique().reset_index()
+    restruct_contracts = contract_batch_count[contract_batch_count['重组批次'] > 1]['原始合同号'].tolist()
+
+    if restruct_contracts:
+        # 步骤B：对重组合同，找到原始批次（批次=0）中标记为ADV的记录
+        mask_restruct_transition = (
+                df['原始合同号'].isin(restruct_contracts)
+                & (df['重组批次'] == 0)
+                & (df['是否结清标志'].astype(str).str.upper() == 'ADV')
+        )
+        # 步骤C：删除这些过渡ADV
+        remove_count = mask_restruct_transition.sum()
+        df = df[~mask_restruct_transition]
+        print(f"已剔除重组过渡ADV记录：{remove_count} 条")
+
+    # ========== 4. 统一合同级基础信息 ==========
+    base_info = (
+        df.sort_values('重组批次')
+        .groupby('原始合同号')
+        .agg(
+            统一起租日=('起租日', 'first'),
+            统一经销商=('经销商名称', 'first'),
+            统一客户=('客户名称', 'first'),
+            统一业务类别=('业务类别', 'first'),
+            统一大区=('所属大区', 'first')
+        )
+        .reset_index()
+    )
+    df = df.merge(base_info, on='原始合同号', how='left')
+
+    df['起租日'] = df['统一起租日']
+    df['经销商名称'] = df['统一经销商']
+    df['客户名称'] = df['统一客户']
+    df['业务类别'] = df['统一业务类别']
+    df['所属大区'] = df['统一大区']
+
+    # 同母体合同+同期号，保留未偿还本金最小的最终账务分录
+    df = df.sort_values(
+        by=["合同号", "期号", "未偿还本金"],
+        ascending=[True, True, False]
+    )
+    df = df.groupby(["合同号", "期号"], as_index=False).tail(1)
+    print(f"同一合同同期多条分录清洗完成，清洗后行数：{len(df)}")
+
+    # ========== 5. 清理临时列 ==========
+    df = df.drop(columns=['原始合同号', '重组批次', '期号偏移',
+                          '统一起租日', '统一经销商', '统一客户', '统一业务类别', '统一大区'])
+
+    print(f"重组合同合并完成，合并后独立合同数：{df['合同号'].nunique()}")
+    return df
 
 
 def merge_excel_to_csv(excel_folder, output_csv, encoding='utf-8-sig',
                        drop_duplicates=True, date_columns=None, numeric_columns=None):
     """
     将文件夹中的所有Excel文件合并为一个CSV文件，并进行数据清洗
-
-    参数:
-    excel_folder: 存放多个Excel文件的文件夹路径
-    output_csv: 合并后的CSV文件路径
-    encoding: 输出CSV的编码格式
-    drop_duplicates: 是否删除重复行
-    date_columns: 需要转换为日期格式的列名列表
-    numeric_columns: 需要转换为数值格式的列名列表
     """
     # 验证输入文件夹是否存在
     if not os.path.exists(excel_folder):
@@ -38,14 +121,15 @@ def merge_excel_to_csv(excel_folder, output_csv, encoding='utf-8-sig',
 
     # 读取所有Excel文件
     # 1. 定义需要保留的列
-    required_columns = ['结清日期', '租金结算日期', '合同号', '经销商名称', '起租日', '期限', '客户名称', '业务类别', '所属大区', '期号', '是否结清标志', '未偿还本金']
+    required_columns = ['结清日期', '租金结算日期', '合同号', '经销商名称', '起租日', '期限', '客户名称', '业务类别',
+                        '所属大区', '期号', '是否结清标志', '未偿还本金']
 
     for i, file in enumerate(excel_files, 1):
         try:
             with pd.ExcelFile(file, engine='openpyxl') as xls:
                 df = pd.read_excel(xls, index_col=None)
 
-            # 新增：筛选必要列（只保留required_columns中存在的列）
+            # 筛选必要列
             available_cols = [col for col in required_columns if col in df.columns]
             if available_cols:
                 df = df[available_cols]
@@ -73,40 +157,15 @@ def merge_excel_to_csv(excel_folder, output_csv, encoding='utf-8-sig',
     original_rows = len(combined_df)
     print(f"\n合并后原始数据总行数: {original_rows}")
 
-    # 数据清洗步骤中，新增：
+    # ========== 数据清洗 ==========
     # 1. 过滤全为NaN的空行
     before_empty_filter = len(combined_df)
-    combined_df = combined_df.dropna(how='all')  # 只删除“所有列都为NaN”的行
+    combined_df = combined_df.dropna(how='all')
     empty_rows_removed = before_empty_filter - len(combined_df)
     if empty_rows_removed > 0:
         print(f"已过滤全为空的行: {empty_rows_removed} 行")
-    # 1. 过滤合同号中包含-CZ或-RA的记录
-    if '合同号' in combined_df.columns:
-        # 统计需要过滤的记录数
-        before_filter = len(combined_df)
-        # 使用使用str.contains进行模糊匹配，case=False表示不区分大小写
-        combined_df = combined_df[~combined_df['合同号'].astype(str).str.contains('-CZ|-ra', case=False, na=False)]
-        filtered_rows = before_filter - len(combined_df)
-        print(f"已过滤包含-CZ或-RA的合同记录: {filtered_rows} 行")
-    else:
-        print("警告：数据中未找到'合同号'列，无法进行合同号过滤")
 
-    # 2. 删除完全重复的行
-    if drop_duplicates:
-        combined_df = combined_df.drop_duplicates()
-        duplicate_rows = original_rows - len(combined_df) - (filtered_rows if '合同号' in combined_df.columns else 0)
-        if duplicate_rows > 0:
-            print(f"已删除重复行: {duplicate_rows} 行")
-
-    # 3. 处理缺失值（标记而非删除，避免数据丢失）
-    missing_values = combined_df.isnull().sum()
-    missing_columns = [col for col, count in missing_values.items() if count > 0]
-    if missing_columns:
-        print("\n存在缺失值的列:")
-        for col in missing_columns:
-            print(f"  {col}: {missing_values[col]} 个缺失值")
-
-    # 4. 转换日期格式
+    # 2. 转换日期格式（提前转换，方便后续业务逻辑处理）
     if date_columns:
         for col in date_columns:
             if col in combined_df.columns:
@@ -116,7 +175,7 @@ def merge_excel_to_csv(excel_folder, output_csv, encoding='utf-8-sig',
                 except Exception as e:
                     print(f"转换列 '{col}' 为日期格式失败: {str(e)}")
 
-    # 5. 转换数值格式
+    # 3. 转换数值格式（提前转换，方便期号偏移计算）
     if numeric_columns:
         for col in numeric_columns:
             if col in combined_df.columns:
@@ -127,6 +186,28 @@ def merge_excel_to_csv(excel_folder, output_csv, encoding='utf-8-sig',
                     print(f"已将列 '{col}' 转换为数值格式")
                 except Exception as e:
                     print(f"转换列 '{col}' 为数值格式失败: {str(e)}")
+
+    # ========== 新增：合并重组合同（替换原删除逻辑） ==========
+    if '合同号' in combined_df.columns and '期号' in combined_df.columns:
+        combined_df = merge_restruct_contracts(combined_df)
+    else:
+        print("警告：缺少合同号或期号列，跳过重组合同合并")
+
+    # 4. 删除完全重复的行
+    if drop_duplicates:
+        before_dedup = len(combined_df)
+        combined_df = combined_df.drop_duplicates()
+        duplicate_rows = before_dedup - len(combined_df)
+        if duplicate_rows > 0:
+            print(f"已删除重复行: {duplicate_rows} 行")
+
+    # 5. 处理缺失值统计
+    missing_values = combined_df.isnull().sum()
+    missing_columns = [col for col, count in missing_values.items() if count > 0]
+    if missing_columns:
+        print("\n存在缺失值的列:")
+        for col in missing_columns:
+            print(f"  {col}: {missing_values[col]} 个缺失值")
 
     # 保存清洗后的结果
     combined_df.to_csv(output_csv, index=False, encoding=encoding)
@@ -145,16 +226,14 @@ if __name__ == "__main__":
     excel_folder_path = r"D:\Filelist\Python_list\File_list\系统导出的Excel文件"
     output_csv_path = r"D:\Filelist\Python_list\File_list\汇总的租金收入表.csv"
 
-    # 根据你的实际列名修改以下配置
-    # 主程序中修改：匹配required_columns中的日期/数值列
-    date_cols = ['结清日期', '租金结算日期', '起租日']  # 所有日期类型列
-    numeric_cols = ['未偿还本金', '期限', '期号']  # 所有数值类型列（期号、期限也是数值）
+    date_cols = ['结清日期', '租金结算日期', '起租日']
+    numeric_cols = ['未偿还本金', '期限', '期号']
 
     # 执行合并和清洗
     merge_excel_to_csv(
         excel_folder=excel_folder_path,
         output_csv=output_csv_path,
-        drop_duplicates=True,  # 开启去重
+        drop_duplicates=True,
         date_columns=date_cols,
         numeric_columns=numeric_cols
     )
